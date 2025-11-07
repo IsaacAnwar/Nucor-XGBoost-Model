@@ -34,6 +34,16 @@ def load_prepared_data() -> pd.DataFrame:
         )
     
     df = pd.read_csv(data_path, parse_dates=['Date'])
+    
+    # Handle timezone-aware dates - convert to timezone-naive
+    if pd.api.types.is_datetime64_any_dtype(df['Date']):
+        if df['Date'].dt.tz is not None:
+            df['Date'] = df['Date'].dt.tz_localize(None)
+    else:
+        df['Date'] = pd.to_datetime(df['Date'], utc=True)
+        if df['Date'].dt.tz is not None:
+            df['Date'] = df['Date'].dt.tz_localize(None)
+    
     logger.info(f"Loaded prepared data: {df.shape}")
     return df
 
@@ -52,9 +62,23 @@ def prepare_train_test_split(df: pd.DataFrame) -> tuple:
     tuple
         (X_train, X_test, y_train, y_test, train_dates, test_dates)
     """
+    # Ensure Date column is datetime type (handle timezone-aware dates)
+    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+        df['Date'] = pd.to_datetime(df['Date'], utc=True)
+    
+    # If Date column is timezone-aware, convert to timezone-naive
+    if df['Date'].dt.tz is not None:
+        df['Date'] = df['Date'].dt.tz_localize(None)
+    
+    # Convert date strings to Timestamps for comparison
+    train_start = pd.to_datetime(TRAIN_START)
+    train_end = pd.to_datetime(TRAIN_END)
+    test_start = pd.to_datetime(TEST_START)
+    test_end = pd.to_datetime(TEST_END)
+    
     # Filter by date ranges
-    train_mask = (df['Date'] >= TRAIN_START) & (df['Date'] <= TRAIN_END)
-    test_mask = (df['Date'] >= TEST_START) & (df['Date'] <= TEST_END)
+    train_mask = (df['Date'] >= train_start) & (df['Date'] <= train_end)
+    test_mask = (df['Date'] >= test_start) & (df['Date'] <= test_end)
     
     train_df = df[train_mask].copy()
     test_df = df[test_mask].copy()
@@ -62,8 +86,27 @@ def prepare_train_test_split(df: pd.DataFrame) -> tuple:
     logger.info(f"Train set: {len(train_df)} samples ({TRAIN_START} to {TRAIN_END})")
     logger.info(f"Test set: {len(test_df)} samples ({TEST_START} to {TEST_END})")
     
+    # Check if target variable exists
+    if 'EPS_Growth_6M' not in df.columns:
+        error_msg = (
+            "Target variable 'EPS_Growth_6M' not found in dataset. "
+            "This usually means EPS data was not successfully fetched from Yahoo Finance. "
+            "The fundamentals data may only contain price data as a fallback. "
+            "Please check:\n"
+            "1. Internet connection\n"
+            "2. Yahoo Finance API availability\n"
+            "3. Try re-running data acquisition: python src/data_acquisition/main.py"
+        )
+        logger.error(error_msg)
+        raise KeyError(error_msg)
+    
     # Separate features and target
     feature_cols = [col for col in df.columns if col not in ['Date', 'EPS_Growth_6M']]
+    
+    if len(feature_cols) == 0:
+        error_msg = "No features found in dataset. Please check data preparation step."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     X_train = train_df[feature_cols].copy()
     y_train = train_df['EPS_Growth_6M'].copy()
@@ -72,6 +115,16 @@ def prepare_train_test_split(df: pd.DataFrame) -> tuple:
     X_test = test_df[feature_cols].copy()
     y_test = test_df['EPS_Growth_6M'].copy()
     test_dates = test_df['Date'].copy()
+    
+    # Check if we have any valid target values
+    if y_train.isna().all():
+        error_msg = (
+            "All target values are missing in training set. "
+            "This means EPS data was not available to create the target variable. "
+            "Please ensure fundamentals data includes EPS column."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     # Handle missing values
     X_train = X_train.fillna(X_train.median())

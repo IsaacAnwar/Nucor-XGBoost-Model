@@ -52,17 +52,27 @@ def fetch_market_data(
                 continue
             
             # Use adjusted close for returns calculation
+            # Handle different column name variations
+            if 'Adj Close' in hist.columns:
+                adj_close_col = 'Adj Close'
+            elif 'Adj. Close' in hist.columns:
+                adj_close_col = 'Adj. Close'
+            else:
+                adj_close_col = 'Close'  # Fallback to Close if Adj Close not available
+                logger.warning(f"Using 'Close' instead of 'Adj Close' for {ticker}")
+            
             all_data[f"{ticker}_Close"] = hist['Close']
-            all_data[f"{ticker}_AdjClose"] = hist['Adj Close']
-            all_data[f"{ticker}_Volume"] = hist['Volume']
+            all_data[f"{ticker}_AdjClose"] = hist[adj_close_col]
+            if 'Volume' in hist.columns:
+                all_data[f"{ticker}_Volume"] = hist['Volume']
             
             # Calculate returns
-            all_data[f"{ticker}_Return"] = hist['Adj Close'].pct_change()
-            all_data[f"{ticker}_Return_3M"] = hist['Adj Close'].pct_change(63)  # ~3 months
-            all_data[f"{ticker}_Return_6M"] = hist['Adj Close'].pct_change(126)  # ~6 months
+            all_data[f"{ticker}_Return"] = hist[adj_close_col].pct_change()
+            all_data[f"{ticker}_Return_3M"] = hist[adj_close_col].pct_change(63)  # ~3 months
+            all_data[f"{ticker}_Return_6M"] = hist[adj_close_col].pct_change(126)  # ~6 months
             
             # Calculate rolling volatility (30-day)
-            all_data[f"{ticker}_Volatility"] = hist['Adj Close'].pct_change().rolling(30).std()
+            all_data[f"{ticker}_Volatility"] = hist[adj_close_col].pct_change().rolling(30).std()
             
             logger.info(f"Successfully fetched {len(hist)} days of data for {ticker}")
             
@@ -80,7 +90,7 @@ def fetch_market_data(
     # Resample to quarter-end if requested
     if resample_to_quarter:
         logger.info("Resampling to quarter-end")
-        market_df = market_df.resample('Q').last()
+        market_df = market_df.resample('QE').last()  # QE = quarter end (replaces deprecated 'Q')
         market_df.index.name = 'Date'
     
     return market_df.reset_index()

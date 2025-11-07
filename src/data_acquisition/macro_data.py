@@ -90,7 +90,7 @@ def fetch_macro_data(
     # Resample to quarter-end if requested
     if resample_to_quarter:
         logger.info("Resampling to quarter-end")
-        macro_df = macro_df.resample('Q').last()
+        macro_df = macro_df.resample('QE').last()  # QE = quarter end (replaces deprecated 'Q')
     
     # Calculate year-over-year changes for key indicators
     if 'Consumer Price Index for All Urban Consumers: All Items' in macro_df.columns:

@@ -45,10 +45,13 @@ def fetch_fundamentals(ticker: str = "NUE", start_date: str = "2010-01-01") -> p
         quarterly_balance = stock.quarterly_balance_sheet
         quarterly_cashflow = stock.quarterly_cashflow
         
-        # Get earnings data
-        earnings = stock.quarterly_earnings
+        # Get earnings data (deprecated, try income statement instead)
+        try:
+            earnings = stock.quarterly_earnings
+        except:
+            earnings = None
         
-        if quarterly_financials.empty or earnings.empty:
+        if quarterly_financials.empty:
             logger.warning(f"Insufficient data for {ticker}, trying alternative method")
             return _fetch_alternative_fundamentals(ticker, start_date)
         
@@ -78,8 +81,24 @@ def fetch_fundamentals(ticker: str = "NUE", start_date: str = "2010-01-01") -> p
             if 'Total Assets' in quarterly_balance.index:
                 fundamentals['TotalAssets'] = quarterly_balance.loc['Total Assets'].values
         
-        # EPS from earnings
-        fundamentals['EPS'] = earnings['Earnings'].values
+        # Try to get EPS from earnings, or calculate from Net Income and shares
+        if earnings is not None and not earnings.empty:
+            fundamentals['EPS'] = earnings['Earnings'].values
+        elif 'NetIncome' in fundamentals.columns:
+            # Try to get shares outstanding from info
+            try:
+                info = stock.info
+                shares_outstanding = info.get('sharesOutstanding', None)
+                if shares_outstanding:
+                    fundamentals['EPS'] = fundamentals['NetIncome'] / shares_outstanding
+                    logger.info("Calculated EPS from Net Income and shares outstanding")
+                else:
+                    logger.warning("Could not calculate EPS - shares outstanding not available")
+            except:
+                logger.warning("Could not fetch shares outstanding to calculate EPS")
+        
+        if 'EPS' not in fundamentals.columns:
+            logger.warning(f"EPS data not available for {ticker} - model training will fail without it")
         
         # Filter by start date
         fundamentals = fundamentals[fundamentals.index >= start_date]

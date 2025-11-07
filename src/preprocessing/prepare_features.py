@@ -113,9 +113,9 @@ def engineer_fundamental_features(fundamentals: pd.DataFrame) -> pd.DataFrame:
     
     # Revenue growth
     if 'Revenue' in fundamentals.columns:
-        fundamentals['Revenue_Growth_QoQ'] = fundamentals['Revenue'].pct_change()
-        fundamentals['Revenue_Growth_YoY'] = fundamentals['Revenue'].pct_change(4)
-        fundamentals['Revenue_Growth_2Q'] = fundamentals['Revenue'].pct_change(2)
+        fundamentals['Revenue_Growth_QoQ'] = fundamentals['Revenue'].pct_change(fill_method=None)
+        fundamentals['Revenue_Growth_YoY'] = fundamentals['Revenue'].pct_change(4, fill_method=None)
+        fundamentals['Revenue_Growth_2Q'] = fundamentals['Revenue'].pct_change(2, fill_method=None)
     
     # Margin trends
     if 'GrossMargin' in fundamentals.columns:
@@ -135,8 +135,8 @@ def engineer_fundamental_features(fundamentals: pd.DataFrame) -> pd.DataFrame:
     
     # EPS trends
     if 'EPS' in fundamentals.columns:
-        fundamentals['EPS_Growth_QoQ'] = fundamentals['EPS'].pct_change()
-        fundamentals['EPS_Growth_YoY'] = fundamentals['EPS'].pct_change(4)
+        fundamentals['EPS_Growth_QoQ'] = fundamentals['EPS'].pct_change(fill_method=None)
+        fundamentals['EPS_Growth_YoY'] = fundamentals['EPS'].pct_change(4, fill_method=None)
     
     return fundamentals
 
@@ -166,15 +166,14 @@ def engineer_market_features(market: pd.DataFrame, ticker: str = "NUE") -> pd.Da
     # Volatility trends
     vol_col = f"{ticker}_Volatility"
     if vol_col in market.columns:
-        market[f"{ticker}_Volatility_Change'] = market[vol_col].diff()
-        market[f"{ticker}_Volatility_MA'] = market[vol_col].rolling(4).mean()
+        market[f"{ticker}_Volatility_Change"] = market[vol_col].diff()
+        market[f"{ticker}_Volatility_MA"] = market[vol_col].rolling(4).mean()
     
     # Volume trends (if available)
     vol_col = f"{ticker}_Volume"
     if vol_col in market.columns:
-        market[f"{ticker}_Volume_MA'] = market[vol_col].rolling(4).mean()
-        market[f"{ticker}_Volume_Ratio'] = market[vol_col] / market[f"{ticker}_Volume_MA"]
-    
+        market[f"{ticker}_Volume_MA"] = market[vol_col].rolling(4).mean()
+        market[f"{ticker}_Volume_Ratio"] = market[vol_col] / market[f"{ticker}_Volume_MA"]
     return market
 
 
@@ -207,10 +206,23 @@ def merge_all_data(
         logger.error("Fundamentals data is empty")
         return pd.DataFrame()
     
+    # Ensure all Date columns are datetime type before merging
+    if 'Date' in fundamentals.columns:
+        if not pd.api.types.is_datetime64_any_dtype(fundamentals['Date']):
+            fundamentals['Date'] = pd.to_datetime(fundamentals['Date'], utc=True)
+        if fundamentals['Date'].dt.tz is not None:
+            fundamentals['Date'] = fundamentals['Date'].dt.tz_localize(None)
+    
     merged = fundamentals.copy()
     
     # Merge market data
     if not market.empty:
+        if 'Date' in market.columns:
+            if not pd.api.types.is_datetime64_any_dtype(market['Date']):
+                market['Date'] = pd.to_datetime(market['Date'], utc=True)
+            if market['Date'].dt.tz is not None:
+                market['Date'] = market['Date'].dt.tz_localize(None)
+        
         merged = merged.merge(
             market,
             on='Date',
@@ -223,6 +235,12 @@ def merge_all_data(
     
     # Merge macro data
     if not macro.empty:
+        if 'Date' in macro.columns:
+            if not pd.api.types.is_datetime64_any_dtype(macro['Date']):
+                macro['Date'] = pd.to_datetime(macro['Date'], utc=True)
+            if macro['Date'].dt.tz is not None:
+                macro['Date'] = macro['Date'].dt.tz_localize(None)
+        
         merged = merged.merge(
             macro,
             on='Date',

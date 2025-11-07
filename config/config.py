@@ -6,7 +6,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+# Try loading from project root first, then current directory
+env_path = Path(__file__).parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    load_dotenv()  # Fallback to default behavior
 
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.parent
