@@ -35,6 +35,16 @@ TICKER = "NUE"  # Nucor
 MARKET_INDEX = "^GSPC"  # S&P 500
 SECTOR_ETF = "SLX"  # Steel ETF
 
+# Peer company tickers for relative metrics
+PEER_TICKERS = ["STLD", "X", "CLF"]  # Steel Dynamics, US Steel, Cleveland-Cliffs
+
+# Commodity tickers
+COMMODITY_TICKERS = {
+    "HRC=F": "Steel_HRC_Price",  # Hot Rolled Coil futures
+    "CL=F": "Oil_WTI_Price",  # Crude Oil WTI futures
+    "NG=F": "Gas_NaturalGas_Price",  # Natural Gas futures
+}
+
 # Data date ranges
 TRAIN_START = "2010-01-01"
 TRAIN_END = "2022-12-31"
@@ -49,6 +59,10 @@ FRED_SERIES = {
     "INDPRO": "Industrial Production Index",
     "UMCSENT": "University of Michigan: Consumer Sentiment",
     "PAYEMS": "All Employees, Total Nonfarm",
+    "NAPM": "ISM Manufacturing: PMI Composite Index",
+    "DGORDER": "Manufacturers' New Orders: Durable Goods",
+    "TTLCONS": "Total Construction Spending",
+    "UNRATE": "Unemployment Rate",
 }
 
 # Model parameters
@@ -62,6 +76,26 @@ XGBOOST_PARAMS = {
     "random_state": 42,
     "n_jobs": -1,
 }
+
+# Hyperparameter search space for Optuna
+HYPERPARAMETER_SEARCH_SPACE = {
+    "n_estimators": (100, 1000),
+    "max_depth": (3, 8),
+    "learning_rate": (0.01, 0.3),
+    "subsample": (0.6, 1.0),
+    "colsample_bytree": (0.6, 1.0),
+    "min_child_weight": (1, 10),
+    "gamma": (0, 5),
+    "reg_alpha": (0, 10),
+    "reg_lambda": (0, 10),
+}
+
+# Critical features that must be present for model training
+CRITICAL_FEATURES = [
+    "EPS",
+    "Revenue",
+    "Date",
+]
 
 # Evaluation metrics
 EVAL_METRICS = ["mae", "rmse", "r2"]

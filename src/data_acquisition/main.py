@@ -11,12 +11,14 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config.config import (
     DATA_RAW, TICKER, MARKET_INDEX, SECTOR_ETF,
-    TRAIN_START, FRED_SERIES
+    TRAIN_START, FRED_SERIES, PEER_TICKERS
 )
 
 from src.data_acquisition.fundamentals import fetch_fundamentals, save_fundamentals
 from src.data_acquisition.market_data import fetch_market_data, save_market_data
 from src.data_acquisition.macro_data import fetch_macro_data, save_macro_data
+from src.data_acquisition.commodity_data import fetch_commodity_data, save_commodity_data
+from src.data_acquisition.peer_data import fetch_peer_fundamentals, save_peer_data
 
 # Setup logging
 logging.basicConfig(
@@ -61,6 +63,22 @@ def main():
         save_macro_data(macro_data, snapshot_dir)
     else:
         logger.warning("No macro data fetched")
+    
+    # 4. Fetch commodity data
+    logger.info("\n4. Fetching commodity data...")
+    commodity_data = fetch_commodity_data(TRAIN_START, resample_to_quarter=True)
+    if not commodity_data.empty:
+        save_commodity_data(commodity_data, snapshot_dir)
+    else:
+        logger.warning("No commodity data fetched")
+    
+    # 5. Fetch peer company data
+    logger.info("\n5. Fetching peer company fundamentals...")
+    peer_data = fetch_peer_fundamentals(PEER_TICKERS, TRAIN_START)
+    if not peer_data.empty:
+        save_peer_data(peer_data, snapshot_dir)
+    else:
+        logger.warning("No peer data fetched")
     
     logger.info("\n" + "=" * 60)
     logger.info("Data acquisition complete!")

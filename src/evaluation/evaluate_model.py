@@ -19,7 +19,9 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config.config import DATA_PROCESSED, MODELS_DIR
-from src.modeling.train_model import load_prepared_data, prepare_train_test_split
+from src.modeling.train_model import (
+    load_prepared_data, prepare_train_test_split, calculate_prediction_intervals
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ sns.set_palette("husl")
 
 
 def load_latest_model():
-    """Load the most recent trained model."""
+    """Load the most recent trained model and quantile models if available."""
     model_path = MODELS_DIR / "latest_model.pkl"
     metadata_path = MODELS_DIR / "latest_metadata.json"
     
@@ -47,7 +49,18 @@ def load_latest_model():
     logger.info(f"Loaded model from {model_path}")
     logger.info(f"Model trained on: {metadata.get('timestamp', 'unknown')}")
     
-    return model, metadata
+    # Load quantile models if available
+    quantile_models = None
+    if metadata.get('has_prediction_intervals', False):
+        quantile_models = {}
+        for quantile in [0.05, 0.95]:
+            q_path = MODELS_DIR / f"latest_quantile_model_{int(quantile*100)}.pkl"
+            if q_path.exists():
+                with open(q_path, 'rb') as f:
+                    quantile_models[quantile] = pickle.load(f)
+                logger.info(f"Loaded quantile model for {quantile*100}th percentile")
+    
+    return model, metadata, quantile_models
 
 
 def plot_predictions_vs_actual(
@@ -202,6 +215,133 @@ def plot_shap_importance(
     return explainer, shap_values
 
 
+def calculate_directional_accuracy(y_true: pd.Series, y_pred: np.ndarray) -> dict:
+    """
+    Calculate directional accuracy (percentage of correct up/down predictions).
+    
+    Parameters:
+    -----------
+    y_true : pd.Series
+        True target values
+    y_pred : np.ndarray
+        Predicted values
+    
+    Returns:
+    --------
+    dict
+        Dictionary with directional accuracy metrics
+    """
+    # Calculate actual and predicted directions
+    actual_direction = np.sign(y_true.diff().dropna())
+    pred_direction = np.sign(pd.Series(y_pred).diff().dropna())
+    
+    # Align indices
+    common_idx = actual_direction.index.intersection(pred_direction.index)
+    actual_dir_aligned = actual_direction.loc[common_idx]
+    pred_dir_aligned = pred_direction.loc[common_idx]
+    
+    # Calculate accuracy
+    correct = (actual_dir_aligned == pred_dir_aligned).sum()
+    total = len(actual_dir_aligned)
+    accuracy = correct / total if total > 0 else 0
+    
+    metrics = {
+        'directional_accuracy': accuracy,
+        'correct_predictions': int(correct),
+        'total_predictions': total
+    }
+    
+    logger.info(f"Directional Accuracy: {accuracy*100:.2f}% ({correct}/{total})")
+    
+    return metrics
+
+
+def plot_prediction_intervals(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    intervals: pd.DataFrame,
+    dates: pd.Series,
+    save_path: Path = None
+):
+    """Plot predictions with confidence intervals."""
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Plot actual
+    ax.plot(dates, y_true, label='Actual', marker='o', linewidth=2, color='black')
+    
+    # Plot predictions
+    ax.plot(dates, y_pred, label='Predicted', marker='s', linewidth=2, alpha=0.7, color='blue')
+    
+    # Plot confidence intervals
+    if 'lower' in intervals.columns and 'upper' in intervals.columns:
+        ax.fill_between(
+            dates,
+            intervals['lower'],
+            intervals['upper'],
+            alpha=0.3,
+            color='blue',
+            label='90% Prediction Interval'
+        )
+    
+    ax.set_xlabel('Date')
+    ax.set_ylabel('EPS Growth (6M)')
+    ax.set_title('Predictions with Confidence Intervals')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Saved prediction intervals plot to {save_path}")
+    
+    plt.show()
+
+
+def calculate_quantile_metrics(
+    y_true: pd.Series,
+    intervals: pd.DataFrame
+) -> dict:
+    """
+    Calculate metrics for prediction intervals.
+    
+    Parameters:
+    -----------
+    y_true : pd.Series
+        True target values
+    intervals : pd.DataFrame
+        DataFrame with prediction, lower, upper columns
+    
+    Returns:
+    --------
+    dict
+        Quantile metrics
+    """
+    if 'lower' not in intervals.columns or 'upper' not in intervals.columns:
+        return {}
+    
+    # Coverage: percentage of actual values within interval
+    coverage = ((y_true >= intervals['lower']) & (y_true <= intervals['upper'])).mean()
+    
+    # Interval width
+    interval_width = (intervals['upper'] - intervals['lower']).mean()
+    
+    # Mean absolute interval width
+    mae_width = (intervals['upper'] - intervals['lower']).abs().mean()
+    
+    metrics = {
+        'coverage': coverage,
+        'mean_interval_width': interval_width,
+        'mae_interval_width': mae_width
+    }
+    
+    logger.info(f"Interval Coverage: {coverage*100:.2f}%")
+    logger.info(f"Mean Interval Width: {interval_width:.4f}")
+    
+    return metrics
+
+
 def main():
     """Main evaluation pipeline."""
     logger.info("=" * 60)
@@ -209,7 +349,7 @@ def main():
     logger.info("=" * 60)
     
     # Load model
-    model, metadata = load_latest_model()
+    model, metadata, quantile_models = load_latest_model()
     
     # Load data
     df = load_prepared_data()
@@ -222,6 +362,18 @@ def main():
     # Generate predictions
     y_train_pred = model.predict(X_train)
     y_test_pred = model.predict(X_test)
+    
+    # Calculate directional accuracy
+    train_dir_metrics = calculate_directional_accuracy(y_train, y_train_pred)
+    test_dir_metrics = calculate_directional_accuracy(y_test, y_test_pred)
+    
+    # Calculate prediction intervals if available
+    test_intervals = None
+    if quantile_models:
+        test_intervals = calculate_prediction_intervals(
+            model, X_test, quantile_models, method="quantile"
+        )
+        quantile_metrics = calculate_quantile_metrics(y_test, test_intervals)
     
     # Create output directory
     output_dir = Path("notebooks") / "evaluation_results"
@@ -254,6 +406,13 @@ def main():
         )
     except Exception as e:
         logger.warning(f"SHAP analysis failed: {e}")
+    
+    # Plot prediction intervals if available
+    if test_intervals is not None:
+        plot_prediction_intervals(
+            y_test, y_test_pred, test_intervals, test_dates,
+            save_path=output_dir / "prediction_intervals.png"
+        )
     
     logger.info("\n" + "=" * 60)
     logger.info("Evaluation complete!")

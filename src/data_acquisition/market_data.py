@@ -6,6 +6,12 @@ import yfinance as yf
 from datetime import datetime
 import logging
 from pathlib import Path
+import sys
+import os
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from src.utils.technical_indicators import add_technical_indicators
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,47 @@ def fetch_market_data(
     
     # Combine into single DataFrame
     market_df = pd.DataFrame(all_data)
+    
+    # Add technical indicators for each ticker before resampling
+    if not resample_to_quarter:  # Only add technical indicators to daily data
+        for ticker in tickers:
+            close_col = f"{ticker}_Close"
+            if close_col in market_df.columns:
+                try:
+                    market_df = add_technical_indicators(
+                        market_df,
+                        price_col=close_col,
+                        prefix=f"{ticker}_"
+                    )
+                except Exception as e:
+                    logger.warning(f"Error adding technical indicators for {ticker}: {e}")
+    
+    # Calculate beta if we have both stock and market data
+    # Find stock ticker (first ticker that's not market index)
+    stock_ticker = None
+    market_ticker = None
+    
+    for ticker in tickers:
+        if ticker.startswith('^') or ticker in ['SPY', 'SPX']:
+            market_ticker = ticker
+        elif stock_ticker is None:
+            stock_ticker = ticker
+    
+    if stock_ticker and market_ticker:
+        stock_return_col = f"{stock_ticker}_Return"
+        market_return_col = f"{market_ticker}_Return"
+        
+        if stock_return_col in market_df.columns and market_return_col in market_df.columns:
+            logger.info(f"Calculating rolling beta for {stock_ticker} vs {market_ticker}")
+            try:
+                beta_series = calculate_beta(
+                    market_df[stock_return_col],
+                    market_df[market_return_col]
+                )
+                market_df[f"{stock_ticker}_Beta"] = beta_series
+                logger.info("Beta calculation complete")
+            except Exception as e:
+                logger.warning(f"Error calculating beta: {e}")
     
     # Resample to quarter-end if requested
     if resample_to_quarter:

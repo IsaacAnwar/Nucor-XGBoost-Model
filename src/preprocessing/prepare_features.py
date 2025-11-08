@@ -26,7 +26,7 @@ def load_latest_data(data_dir: Path) -> tuple:
     Returns:
     --------
     tuple
-        (fundamentals_df, market_df, macro_df)
+        (fundamentals_df, market_df, macro_df, commodity_df, peer_df)
     """
     # Find latest snapshot directory
     snapshot_dirs = [d for d in data_dir.iterdir() if d.is_dir() and d.name != ".gitkeep"]
@@ -41,10 +41,14 @@ def load_latest_data(data_dir: Path) -> tuple:
     fundamentals_path = latest_snapshot / f"{TICKER}_fundamentals.csv"
     market_path = latest_snapshot / "market_data.csv"
     macro_path = latest_snapshot / "macro_data.csv"
+    commodity_path = latest_snapshot / "commodity_data.csv"
+    peer_path = latest_snapshot / "peer_data.csv"
     
     fundamentals = pd.DataFrame()
     market = pd.DataFrame()
     macro = pd.DataFrame()
+    commodity = pd.DataFrame()
+    peer = pd.DataFrame()
     
     if fundamentals_path.exists():
         fundamentals = pd.read_csv(fundamentals_path, parse_dates=['Date'])
@@ -61,7 +65,17 @@ def load_latest_data(data_dir: Path) -> tuple:
     else:
         logger.warning(f"Macro data file not found: {macro_path}")
     
-    return fundamentals, market, macro
+    if commodity_path.exists():
+        commodity = pd.read_csv(commodity_path, parse_dates=['Date'])
+    else:
+        logger.warning(f"Commodity data file not found: {commodity_path}")
+    
+    if peer_path.exists():
+        peer = pd.read_csv(peer_path, parse_dates=['Date'])
+    else:
+        logger.warning(f"Peer data file not found: {peer_path}")
+    
+    return fundamentals, market, macro, commodity, peer
 
 
 def create_target_variable(fundamentals: pd.DataFrame) -> pd.DataFrame:
@@ -177,10 +191,122 @@ def engineer_market_features(market: pd.DataFrame, ticker: str = "NUE") -> pd.Da
     return market
 
 
+def engineer_commodity_features(commodity: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create derived commodity features.
+    
+    Features:
+    - Commodity price returns
+    - Steel price momentum
+    - Energy cost indicators
+    """
+    commodity = commodity.sort_values('Date').copy()
+    
+    # Additional momentum features
+    if 'Steel_HRC_Price' in commodity.columns:
+        commodity['Steel_HRC_Momentum'] = commodity['Steel_HRC_Price'].pct_change(2)  # 2-quarter momentum
+    
+    if 'Oil_WTI_Price' in commodity.columns:
+        commodity['Oil_WTI_Momentum'] = commodity['Oil_WTI_Price'].pct_change(2)
+    
+    return commodity
+
+
+def engineer_peer_features(fundamentals: pd.DataFrame, peer: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create relative metrics comparing NUE to peer averages.
+    
+    Features:
+    - Revenue growth vs peers
+    - Margin vs peers
+    - EPS growth vs peers
+    """
+    if peer.empty:
+        logger.warning("Peer data is empty, skipping peer feature engineering")
+        return fundamentals
+    
+    fundamentals = fundamentals.sort_values('Date').copy()
+    peer = peer.sort_values('Date').copy()
+    
+    # Merge peer data
+    merged = fundamentals.merge(
+        peer,
+        on='Date',
+        how='left',
+        suffixes=('', '_peer')
+    )
+    
+    # Calculate relative metrics
+    if 'Revenue' in merged.columns and 'Peer_Revenue_Mean' in merged.columns:
+        merged['Revenue_vs_Peer'] = merged['Revenue'] / merged['Peer_Revenue_Mean']
+        merged['Revenue_Growth_vs_Peer'] = (
+            merged.get('Revenue_Growth_QoQ', 0) - merged.get('Peer_Revenue_Growth_QoQ_Mean', 0)
+        )
+    
+    if 'EPS' in merged.columns and 'Peer_EPS_Mean' in merged.columns:
+        merged['EPS_vs_Peer'] = merged['EPS'] / merged['Peer_EPS_Mean']
+        merged['EPS_Growth_vs_Peer'] = (
+            merged.get('EPS_Growth_QoQ', 0) - merged.get('Peer_EPS_Growth_QoQ_Mean', 0)
+        )
+    
+    if 'GrossMargin' in merged.columns and 'Peer_GrossMargin_Mean' in merged.columns:
+        merged['GrossMargin_vs_Peer'] = merged['GrossMargin'] - merged['Peer_GrossMargin_Mean']
+    
+    if 'OperatingMargin' in merged.columns and 'Peer_OperatingMargin_Mean' in merged.columns:
+        merged['OperatingMargin_vs_Peer'] = merged['OperatingMargin'] - merged['Peer_OperatingMargin_Mean']
+    
+    return merged
+
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add interaction features between key variables.
+    
+    Features:
+    - PMI × Steel Prices
+    - PMI × Revenue Growth
+    - Steel Prices × Revenue
+    """
+    df = df.copy()
+    
+    # PMI × Steel Prices interaction
+    pmi_col = None
+    steel_col = None
+    
+    for col in df.columns:
+        if 'PMI' in col and 'Change' not in col and 'YoY' not in col:
+            pmi_col = col
+        if 'Steel_HRC' in col and 'Price' in col and 'Return' not in col and 'YoY' not in col:
+            steel_col = col
+    
+    if pmi_col and steel_col:
+        df['PMI_Steel_Interaction'] = df[pmi_col] * df[steel_col]
+        logger.info("Added PMI × Steel Prices interaction")
+    
+    # PMI × Revenue Growth
+    if pmi_col and 'Revenue_Growth_QoQ' in df.columns:
+        df['PMI_RevenueGrowth_Interaction'] = df[pmi_col] * df['Revenue_Growth_QoQ']
+    
+    # Steel Prices × Revenue
+    if steel_col and 'Revenue' in df.columns:
+        df['Steel_Revenue_Interaction'] = df[steel_col] * df['Revenue']
+    
+    # Seasonal features (quarter of year)
+    if 'Date' in df.columns:
+        df['Quarter'] = pd.to_datetime(df['Date']).dt.quarter
+        # One-hot encode quarters
+        for q in [1, 2, 3, 4]:
+            df[f'Q{q}'] = (df['Quarter'] == q).astype(int)
+    
+    return df
+
+
 def merge_all_data(
     fundamentals: pd.DataFrame,
     market: pd.DataFrame,
-    macro: pd.DataFrame
+    macro: pd.DataFrame,
+    commodity: pd.DataFrame = None,
+    peer: pd.DataFrame = None
 ) -> pd.DataFrame:
     """
     Merge all data sources on Date (quarter-end).
@@ -250,6 +376,42 @@ def merge_all_data(
         logger.info(f"Merged macro data: {merged.shape}")
     else:
         logger.warning("Macro data is empty, skipping merge")
+    
+    # Merge commodity data
+    if commodity is not None and not commodity.empty:
+        if 'Date' in commodity.columns:
+            if not pd.api.types.is_datetime64_any_dtype(commodity['Date']):
+                commodity['Date'] = pd.to_datetime(commodity['Date'], utc=True)
+            if commodity['Date'].dt.tz is not None:
+                commodity['Date'] = commodity['Date'].dt.tz_localize(None)
+        
+        merged = merged.merge(
+            commodity,
+            on='Date',
+            how='left',
+            suffixes=('', '_commodity')
+        )
+        logger.info(f"Merged commodity data: {merged.shape}")
+    else:
+        logger.warning("Commodity data is empty, skipping merge")
+    
+    # Merge peer data
+    if peer is not None and not peer.empty:
+        if 'Date' in peer.columns:
+            if not pd.api.types.is_datetime64_any_dtype(peer['Date']):
+                peer['Date'] = pd.to_datetime(peer['Date'], utc=True)
+            if peer['Date'].dt.tz is not None:
+                peer['Date'] = peer['Date'].dt.tz_localize(None)
+        
+        merged = merged.merge(
+            peer,
+            on='Date',
+            how='left',
+            suffixes=('', '_peer')
+        )
+        logger.info(f"Merged peer data: {merged.shape}")
+    else:
+        logger.warning("Peer data is empty, skipping merge")
     
     # Sort by date
     merged = merged.sort_values('Date').reset_index(drop=True)
@@ -349,7 +511,7 @@ def prepare_features() -> pd.DataFrame:
     logger.info("=" * 60)
     
     # Load data
-    fundamentals, market, macro = load_latest_data(DATA_RAW)
+    fundamentals, market, macro, commodity, peer = load_latest_data(DATA_RAW)
     
     # Create target variable
     fundamentals = create_target_variable(fundamentals)
@@ -358,8 +520,18 @@ def prepare_features() -> pd.DataFrame:
     fundamentals = engineer_fundamental_features(fundamentals)
     market = engineer_market_features(market, TICKER)
     
+    # Engineer commodity features
+    if not commodity.empty:
+        commodity = engineer_commodity_features(commodity)
+    
+    # Engineer peer relative features
+    fundamentals = engineer_peer_features(fundamentals, peer)
+    
     # Merge all data
-    merged = merge_all_data(fundamentals, market, macro)
+    merged = merge_all_data(fundamentals, market, macro, commodity, peer)
+    
+    # Add interaction features
+    merged = add_interaction_features(merged)
     
     # Lag features
     merged = lag_features(merged)

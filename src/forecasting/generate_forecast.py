@@ -14,13 +14,15 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config.config import DATA_PROCESSED, MODELS_DIR, TICKER
-from src.modeling.train_model import load_prepared_data
+from src.modeling.train_model import (
+    load_prepared_data, calculate_prediction_intervals
+)
 
 logger = logging.getLogger(__name__)
 
 
 def load_latest_model():
-    """Load the most recent trained model and metadata."""
+    """Load the most recent trained model, quantile models, and metadata."""
     model_path = MODELS_DIR / "latest_model.pkl"
     metadata_path = MODELS_DIR / "latest_metadata.json"
     
@@ -35,7 +37,18 @@ def load_latest_model():
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     
-    return model, metadata
+    # Load quantile models if available
+    quantile_models = None
+    if metadata.get('has_prediction_intervals', False):
+        quantile_models = {}
+        for quantile in [0.05, 0.95]:
+            q_path = MODELS_DIR / f"latest_quantile_model_{int(quantile*100)}.pkl"
+            if q_path.exists():
+                with open(q_path, 'rb') as f:
+                    quantile_models[quantile] = pickle.load(f)
+                logger.info(f"Loaded quantile model for {quantile*100}th percentile")
+    
+    return model, metadata, quantile_models
 
 
 def get_latest_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -61,7 +74,12 @@ def get_latest_features(df: pd.DataFrame) -> pd.DataFrame:
     return latest
 
 
-def generate_forecast(model, features: pd.DataFrame, feature_names: list) -> dict:
+def generate_forecast(
+    model,
+    features: pd.DataFrame,
+    feature_names: list,
+    quantile_models: dict = None
+) -> dict:
     """
     Generate 6-month ahead EPS growth forecast.
     
@@ -88,14 +106,30 @@ def generate_forecast(model, features: pd.DataFrame, feature_names: list) -> dic
     # Generate prediction
     predicted_growth = model.predict(X_forecast)[0]
     
-    logger.info(f"Predicted 6-month EPS growth: {predicted_growth:.4f} ({predicted_growth*100:.2f}%)")
+    # Generate prediction intervals if available
+    intervals = None
+    if quantile_models:
+        intervals_df = calculate_prediction_intervals(
+            model, X_forecast, quantile_models, method="quantile"
+        )
+        intervals = {
+            'lower': intervals_df['lower'].iloc[0],
+            'upper': intervals_df['upper'].iloc[0]
+        }
     
-    return {
+    logger.info(f"Predicted 6-month EPS growth: {predicted_growth:.4f} ({predicted_growth*100:.2f}%)")
+    if intervals:
+        logger.info(f"90% Confidence Interval: [{intervals['lower']:.4f}, {intervals['upper']:.4f}]")
+    
+    result = {
         'predicted_growth': predicted_growth,
         'predicted_growth_pct': predicted_growth * 100,
         'forecast_date': datetime.now().strftime("%Y-%m-%d"),
-        'latest_quarter': features['Date'].values[0] if 'Date' in features.columns else None
+        'latest_quarter': features['Date'].values[0] if 'Date' in features.columns else None,
+        'intervals': intervals
     }
+    
+    return result
 
 
 def translate_to_eps_level(
@@ -127,9 +161,140 @@ def translate_to_eps_level(
     }
 
 
+def scenario_analysis(
+    model,
+    base_features: pd.DataFrame,
+    feature_names: list,
+    scenarios: dict = None
+) -> dict:
+    """
+    Generate forecasts under different macro scenarios.
+    
+    Parameters:
+    -----------
+    model : xgb.XGBRegressor
+        Trained model
+    base_features : pd.DataFrame
+        Base feature set
+    feature_names : list
+        Feature names
+    scenarios : dict
+        Dictionary mapping scenario names to feature adjustments
+        e.g., {'optimistic': {'PMI_Change': +5}, 'pessimistic': {'PMI_Change': -5}}
+    
+    Returns:
+    --------
+    dict
+        Scenario forecasts
+    """
+    if scenarios is None:
+        scenarios = {
+            'baseline': {},
+            'optimistic': {'PMI_Change': 5, 'Steel_HRC_Return_3M': 0.1},
+            'pessimistic': {'PMI_Change': -5, 'Steel_HRC_Return_3M': -0.1}
+        }
+    
+    scenario_results = {}
+    X_base = base_features[feature_names].copy().fillna(base_features[feature_names].median())
+    
+    for scenario_name, adjustments in scenarios.items():
+        X_scenario = X_base.copy()
+        
+        # Apply adjustments
+        for feature, adjustment in adjustments.items():
+            if feature in X_scenario.columns:
+                X_scenario[feature] = X_scenario[feature] + adjustment
+                logger.info(f"Scenario {scenario_name}: Adjusted {feature} by {adjustment}")
+        
+        # Generate forecast
+        forecast = model.predict(X_scenario)[0]
+        scenario_results[scenario_name] = {
+            'forecast': forecast,
+            'forecast_pct': forecast * 100,
+            'adjustments': adjustments
+        }
+    
+    return scenario_results
+
+
+def sensitivity_analysis(
+    model,
+    base_features: pd.DataFrame,
+    feature_names: list,
+    key_features: list = None,
+    variation: float = 0.1
+) -> dict:
+    """
+    Perform sensitivity analysis on key features.
+    
+    Parameters:
+    -----------
+    model : xgb.XGBRegressor
+        Trained model
+    base_features : pd.DataFrame
+        Base feature set
+    feature_names : list
+        Feature names
+    key_features : list
+        Features to vary (if None, uses top important features)
+    variation : float
+        Percentage variation (e.g., 0.1 = ±10%)
+    
+    Returns:
+    --------
+    dict
+        Sensitivity results
+    """
+    X_base = base_features[feature_names].copy().fillna(base_features[feature_names].median())
+    base_forecast = model.predict(X_base)[0]
+    
+    if key_features is None:
+        # Use top 5 features by importance
+        importances = model.feature_importances_
+        feature_importance = pd.DataFrame({
+            'feature': feature_names,
+            'importance': importances
+        }).sort_values('importance', ascending=False)
+        key_features = feature_importance.head(5)['feature'].tolist()
+    
+    sensitivity_results = {}
+    
+    for feature in key_features:
+        if feature not in X_base.columns:
+            continue
+        
+        base_value = X_base[feature].iloc[0]
+        
+        # Vary feature
+        X_high = X_base.copy()
+        X_low = X_base.copy()
+        
+        if base_value != 0:
+            X_high[feature] = base_value * (1 + variation)
+            X_low[feature] = base_value * (1 - variation)
+        else:
+            X_high[feature] = variation
+            X_low[feature] = -variation
+        
+        forecast_high = model.predict(X_high)[0]
+        forecast_low = model.predict(X_low)[0]
+        
+        sensitivity_results[feature] = {
+            'base_value': base_value,
+            'forecast_base': base_forecast,
+            'forecast_high': forecast_high,
+            'forecast_low': forecast_low,
+            'sensitivity': (forecast_high - forecast_low) / (2 * variation) if variation > 0 else 0
+        }
+    
+    return sensitivity_results
+
+
 def format_dcf_comparison(
     forecast_results: dict,
-    eps_results: dict = None
+    eps_results: dict = None,
+    scenarios: dict = None,
+    sensitivity: dict = None
 ) -> str:
     """
     Format forecast results for DCF comparison.
@@ -157,6 +322,10 @@ def format_dcf_comparison(
     report.append("")
     report.append("PREDICTION:")
     report.append(f"  6-Month EPS Growth Rate: {forecast_results['predicted_growth_pct']:.2f}%")
+    
+    if forecast_results.get('intervals'):
+        intervals = forecast_results['intervals']
+        report.append(f"  90% Confidence Interval: [{intervals['lower']*100:.2f}%, {intervals['upper']*100:.2f}%]")
     report.append("")
     
     if eps_results:
@@ -166,12 +335,26 @@ def format_dcf_comparison(
         report.append(f"  Change: ${eps_results['eps_change']:.2f} ({eps_results['eps_change_pct']:.2f}%)")
         report.append("")
     
+    if scenarios:
+        report.append("SCENARIO ANALYSIS:")
+        for scenario_name, scenario_data in scenarios.items():
+            report.append(f"  {scenario_name.capitalize()}: {scenario_data['forecast_pct']:.2f}%")
+        report.append("")
+    
+    if sensitivity:
+        report.append("SENSITIVITY ANALYSIS (Top Features):")
+        for feature, sens_data in list(sensitivity.items())[:5]:
+            report.append(f"  {feature}:")
+            report.append(f"    ±10% change → Forecast: [{sens_data['forecast_low']*100:.2f}%, {sens_data['forecast_high']*100:.2f}%]")
+        report.append("")
+    
     report.append("=" * 60)
     report.append("")
     report.append("DCF INTEGRATION NOTES:")
     report.append("  - Compare this growth rate with your DCF's near-term earnings assumption")
     report.append("  - Use as a consistency check for your terminal growth assumptions")
     report.append("  - Consider this as a data-driven estimate of earnings acceleration")
+    report.append("  - Confidence intervals provide uncertainty quantification")
     report.append("")
     report.append("=" * 60)
     
@@ -181,7 +364,9 @@ def format_dcf_comparison(
 def save_forecast(
     forecast_results: dict,
     eps_results: dict = None,
-    output_dir: Path = None
+    output_dir: Path = None,
+    scenarios: dict = None,
+    sensitivity: dict = None
 ):
     """Save forecast results to JSON and text file."""
     if output_dir is None:
@@ -193,7 +378,9 @@ def save_forecast(
     # Save JSON
     results = {
         'forecast': forecast_results,
-        'eps_projection': eps_results
+        'eps_projection': eps_results,
+        'scenarios': scenarios,
+        'sensitivity': sensitivity
     }
     
     json_path = output_dir / f"forecast_{timestamp}.json"
@@ -202,7 +389,7 @@ def save_forecast(
     logger.info(f"Saved forecast JSON to {json_path}")
     
     # Save formatted report
-    report = format_dcf_comparison(forecast_results, eps_results)
+    report = format_dcf_comparison(forecast_results, eps_results, scenarios, sensitivity)
     txt_path = output_dir / f"forecast_{timestamp}.txt"
     with open(txt_path, 'w') as f:
         f.write(report)
@@ -219,7 +406,7 @@ def main():
     logger.info("=" * 60)
     
     # Load model
-    model, metadata = load_latest_model()
+    model, metadata, quantile_models = load_latest_model()
     feature_names = metadata['feature_names']
     logger.info(f"Loaded model with {len(feature_names)} features")
     
@@ -229,8 +416,8 @@ def main():
     # Get latest features
     latest_features = get_latest_features(df)
     
-    # Generate forecast
-    forecast_results = generate_forecast(model, latest_features, feature_names)
+    # Generate forecast with confidence intervals
+    forecast_results = generate_forecast(model, latest_features, feature_names, quantile_models)
     
     # Get current EPS if available
     eps_results = None
@@ -239,8 +426,24 @@ def main():
         if not pd.isna(current_eps):
             eps_results = translate_to_eps_level(current_eps, forecast_results['predicted_growth'])
     
+    # Scenario analysis
+    scenarios = None
+    try:
+        scenarios = scenario_analysis(model, latest_features, feature_names)
+        logger.info("Generated scenario analysis")
+    except Exception as e:
+        logger.warning(f"Scenario analysis failed: {e}")
+    
+    # Sensitivity analysis
+    sensitivity = None
+    try:
+        sensitivity = sensitivity_analysis(model, latest_features, feature_names)
+        logger.info("Generated sensitivity analysis")
+    except Exception as e:
+        logger.warning(f"Sensitivity analysis failed: {e}")
+    
     # Save and display results
-    save_forecast(forecast_results, eps_results)
+    save_forecast(forecast_results, eps_results, scenarios=scenarios, sensitivity=sensitivity)
     
     logger.info("\n" + "=" * 60)
     logger.info("Forecast generation complete!")

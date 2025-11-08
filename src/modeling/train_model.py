@@ -133,6 +133,95 @@ def prepare_train_test_split(df: pd.DataFrame) -> tuple:
     return X_train, X_test, y_train, y_test, train_dates, test_dates
 
 
+def train_quantile_models(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    quantiles: list = [0.05, 0.95],
+    params: dict = None
+) -> dict:
+    """
+    Train quantile regression models for prediction intervals.
+    
+    Parameters:
+    -----------
+    X_train : pd.DataFrame
+        Training features
+    y_train : pd.Series
+        Training target
+    quantiles : list
+        List of quantiles to predict (e.g., [0.05, 0.95] for 90% interval)
+    params : dict, optional
+        Base XGBoost parameters
+    
+    Returns:
+    --------
+    dict
+        Dictionary mapping quantile to trained model
+    """
+    if params is None:
+        params = XGBOOST_PARAMS.copy()
+    
+    logger.info(f"Training quantile models for quantiles: {quantiles}")
+    quantile_models = {}
+    
+    for quantile in quantiles:
+        q_params = params.copy()
+        q_params['objective'] = f'reg:quantileerror'
+        q_params['quantile_alpha'] = quantile
+        
+        model = xgb.XGBRegressor(**q_params)
+        model.fit(X_train, y_train)
+        quantile_models[quantile] = model
+        
+        logger.info(f"Trained quantile model for {quantile*100}th percentile")
+    
+    return quantile_models
+
+
+def calculate_prediction_intervals(
+    model: xgb.XGBRegressor,
+    X: pd.DataFrame,
+    quantile_models: dict = None,
+    method: str = "quantile"
+) -> pd.DataFrame:
+    """
+    Calculate prediction intervals.
+    
+    Parameters:
+    -----------
+    model : xgb.XGBRegressor
+        Main trained model
+    X : pd.DataFrame
+        Features
+    quantile_models : dict, optional
+        Dictionary of quantile models
+    method : str
+        Method: "quantile" or "bootstrap"
+    
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with columns: prediction, lower, upper
+    """
+    predictions = model.predict(X)
+    results = pd.DataFrame({'prediction': predictions})
+    
+    if method == "quantile" and quantile_models:
+        lower_quantile = min(quantile_models.keys())
+        upper_quantile = max(quantile_models.keys())
+        
+        results['lower'] = quantile_models[lower_quantile].predict(X)
+        results['upper'] = quantile_models[upper_quantile].predict(X)
+    else:
+        # Bootstrap method: use residual standard deviation
+        # This is a simplified version - in practice, you'd bootstrap the residuals
+        std_estimate = predictions.std() * 0.1  # Rough estimate
+        results['lower'] = predictions - 1.96 * std_estimate  # 95% interval
+        results['upper'] = predictions + 1.96 * std_estimate
+    
+    return results
+
+
 def train_xgboost_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -291,7 +380,8 @@ def save_model(
     model: xgb.XGBRegressor,
     metrics: dict,
     feature_names: list,
-    model_dir: Path = None
+    model_dir: Path = None,
+    quantile_models: dict = None
 ):
     """
     Save trained model and metadata.
@@ -319,13 +409,25 @@ def save_model(
         pickle.dump(model, f)
     logger.info(f"Saved model to: {model_path}")
     
+    # Save quantile models if provided
+    quantile_model_paths = {}
+    if quantile_models:
+        for quantile, q_model in quantile_models.items():
+            q_path = model_dir / f"quantile_model_{int(quantile*100)}_{timestamp}.pkl"
+            with open(q_path, 'wb') as f:
+                pickle.dump(q_model, f)
+            quantile_model_paths[quantile] = str(q_path)
+        logger.info(f"Saved {len(quantile_models)} quantile models")
+    
     # Save metadata
     metadata = {
         'timestamp': timestamp,
         'metrics': metrics,
         'feature_names': feature_names,
         'n_features': len(feature_names),
-        'model_params': model.get_params()
+        'model_params': model.get_params(),
+        'has_prediction_intervals': quantile_models is not None,
+        'quantile_models': quantile_model_paths if quantile_models else None
     }
     
     with open(metadata_path, 'w') as f:
@@ -338,6 +440,13 @@ def save_model(
     
     with open(latest_path, 'wb') as f:
         pickle.dump(model, f)
+    
+    # Save latest quantile models
+    if quantile_models:
+        for quantile, q_model in quantile_models.items():
+            latest_q_path = model_dir / f"latest_quantile_model_{int(quantile*100)}.pkl"
+            with open(latest_q_path, 'wb') as f:
+                pickle.dump(q_model, f)
     
     with open(latest_metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -367,6 +476,18 @@ def main():
     # Train model
     model = train_xgboost_model(X_train_fit, y_train_fit, X_val, y_val)
     
+    # Train quantile models for prediction intervals
+    quantile_models = None
+    try:
+        quantile_models = train_quantile_models(
+            X_train_fit.fillna(X_train_fit.median()),
+            y_train_fit,
+            quantiles=[0.05, 0.95]  # 90% prediction interval
+        )
+        logger.info("Successfully trained quantile models for prediction intervals")
+    except Exception as e:
+        logger.warning(f"Could not train quantile models: {e}")
+    
     # Evaluate on train and test
     train_metrics = evaluate_model(model, X_train, y_train, "Train")
     test_metrics = evaluate_model(model, X_test, y_test, "Test")
@@ -375,7 +496,7 @@ def main():
     # cv_metrics = cross_validate_time_series(X_train, y_train, n_splits=5)
     
     # Save model
-    save_model(model, test_metrics, list(X_train.columns))
+    save_model(model, test_metrics, list(X_train.columns), quantile_models=quantile_models)
     
     logger.info("\n" + "=" * 60)
     logger.info("Model training complete!")

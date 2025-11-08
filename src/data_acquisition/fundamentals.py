@@ -1,13 +1,137 @@
 """
-Fetch Nucor (NUE) fundamental data from Yahoo Finance.
+Fetch Nucor (NUE) fundamental data from Yahoo Finance and FinancialModelingPrep.
 """
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 import logging
 from pathlib import Path
+import requests
+import sys
+import os
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from config.config import FMP_API_KEY
 
 logger = logging.getLogger(__name__)
+
+
+def fetch_fundamentals_fmp(ticker: str = "NUE", start_date: str = "2010-01-01") -> pd.DataFrame:
+    """
+    Fetch quarterly fundamental data using FinancialModelingPrep API.
+    
+    Parameters:
+    -----------
+    ticker : str
+        Stock ticker symbol
+    start_date : str
+        Start date for data collection (YYYY-MM-DD)
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Quarterly fundamental metrics
+    """
+    if not FMP_API_KEY:
+        logger.warning("FMP_API_KEY not found. Skipping FMP data fetch.")
+        return pd.DataFrame()
+    
+    logger.info(f"Fetching fundamentals for {ticker} from FinancialModelingPrep")
+    
+    try:
+        # Fetch income statement
+        income_url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
+        params = {
+            'period': 'quarter',
+            'apikey': FMP_API_KEY,
+            'limit': 100  # Get last 100 quarters
+        }
+        
+        response = requests.get(income_url, params=params, timeout=10)
+        response.raise_for_status()
+        income_data = response.json()
+        
+        if not income_data or len(income_data) == 0:
+            logger.warning(f"No income statement data from FMP for {ticker}")
+            return pd.DataFrame()
+        
+        # Fetch balance sheet
+        balance_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{ticker}"
+        balance_response = requests.get(balance_url, params=params, timeout=10)
+        balance_response.raise_for_status()
+        balance_data = balance_response.json()
+        
+        # Convert to DataFrames
+        income_df = pd.DataFrame(income_data)
+        balance_df = pd.DataFrame(balance_data) if balance_data else pd.DataFrame()
+        
+        # Process income statement
+        if income_df.empty:
+            return pd.DataFrame()
+        
+        # Convert date column
+        income_df['date'] = pd.to_datetime(income_df['date'])
+        income_df = income_df.sort_values('date')
+        
+        # Filter by start date
+        income_df = income_df[income_df['date'] >= start_date]
+        
+        # Create fundamentals DataFrame
+        fundamentals = pd.DataFrame()
+        fundamentals['Date'] = income_df['date'].values
+        
+        # Map FMP fields to our standard fields
+        field_mapping = {
+            'revenue': 'Revenue',
+            'grossProfit': 'GrossProfit',
+            'operatingIncome': 'OperatingIncome',
+            'netIncome': 'NetIncome',
+            'eps': 'EPS',
+        }
+        
+        for fmp_field, our_field in field_mapping.items():
+            if fmp_field in income_df.columns:
+                fundamentals[our_field] = income_df[fmp_field].values
+        
+        # Process balance sheet if available
+        if not balance_df.empty:
+            balance_df['date'] = pd.to_datetime(balance_df['date'])
+            balance_df = balance_df.sort_values('date')
+            balance_df = balance_df[balance_df['date'] >= start_date]
+            
+            # Merge balance sheet data
+            for date in fundamentals['Date']:
+                balance_row = balance_df[balance_df['date'] == date]
+                if not balance_row.empty:
+                    idx = fundamentals[fundamentals['Date'] == date].index[0]
+                    if 'totalDebt' in balance_row.columns:
+                        fundamentals.loc[idx, 'TotalDebt'] = balance_row['totalDebt'].values[0]
+                    if 'totalStockholdersEquity' in balance_row.columns:
+                        fundamentals.loc[idx, 'TotalEquity'] = balance_row['totalStockholdersEquity'].values[0]
+                    if 'totalAssets' in balance_row.columns:
+                        fundamentals.loc[idx, 'TotalAssets'] = balance_row['totalAssets'].values[0]
+        
+        # Calculate derived metrics
+        if 'Revenue' in fundamentals.columns and 'GrossProfit' in fundamentals.columns:
+            fundamentals['GrossMargin'] = (fundamentals['GrossProfit'] / fundamentals['Revenue']) * 100
+        if 'Revenue' in fundamentals.columns and 'OperatingIncome' in fundamentals.columns:
+            fundamentals['OperatingMargin'] = (fundamentals['OperatingIncome'] / fundamentals['Revenue']) * 100
+        if 'Revenue' in fundamentals.columns and 'NetIncome' in fundamentals.columns:
+            fundamentals['NetMargin'] = (fundamentals['NetIncome'] / fundamentals['Revenue']) * 100
+        
+        if 'TotalDebt' in fundamentals.columns and 'TotalEquity' in fundamentals.columns:
+            fundamentals['DebtToEquity'] = fundamentals['TotalDebt'] / fundamentals['TotalEquity']
+        
+        logger.info(f"Successfully fetched {len(fundamentals)} quarters of fundamental data from FMP")
+        return fundamentals
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching data from FMP API: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"Unexpected error in FMP fetch: {e}")
+        return pd.DataFrame()
 
 
 def fetch_fundamentals(ticker: str = "NUE", start_date: str = "2010-01-01") -> pd.DataFrame:
@@ -37,6 +161,17 @@ def fetch_fundamentals(ticker: str = "NUE", start_date: str = "2010-01-01") -> p
     """
     logger.info(f"Fetching fundamentals for {ticker} from {start_date}")
     
+    # Try FMP first if API key is available
+    if FMP_API_KEY:
+        logger.info("Attempting to fetch from FinancialModelingPrep API...")
+        fmp_data = fetch_fundamentals_fmp(ticker, start_date)
+        if not fmp_data.empty and 'EPS' in fmp_data.columns:
+            logger.info("Successfully fetched fundamentals from FMP")
+            return fmp_data
+        else:
+            logger.info("FMP data incomplete, falling back to Yahoo Finance")
+    
+    # Fallback to Yahoo Finance
     stock = yf.Ticker(ticker)
     
     # Get quarterly financials

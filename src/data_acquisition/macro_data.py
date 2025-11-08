@@ -106,6 +106,22 @@ def fetch_macro_data(
         rate_col = '10-Year Treasury Constant Maturity Rate'
         macro_df['10Y_Change'] = macro_df[rate_col].diff()
     
+    # Calculate PMI changes (QoQ and YoY)
+    if 'ISM Manufacturing: PMI Composite Index' in macro_df.columns:
+        pmi_col = 'ISM Manufacturing: PMI Composite Index'
+        macro_df['PMI_Change'] = macro_df[pmi_col].diff()  # Quarter-over-quarter change
+        macro_df['PMI_YoY'] = macro_df[pmi_col].pct_change(4) * 100  # Year-over-year % change
+    
+    # Calculate changes for Durable Goods Orders
+    if "Manufacturers' New Orders: Durable Goods" in macro_df.columns:
+        dgo_col = "Manufacturers' New Orders: Durable Goods"
+        macro_df['DGO_YoY'] = macro_df[dgo_col].pct_change(4) * 100
+    
+    # Calculate changes for Construction Spending
+    if 'Total Construction Spending' in macro_df.columns:
+        cons_col = 'Total Construction Spending'
+        macro_df['Construction_YoY'] = macro_df[cons_col].pct_change(4) * 100
+    
     logger.info(f"Successfully fetched {len(macro_df)} periods of macro data")
     return macro_df.reset_index()
 
